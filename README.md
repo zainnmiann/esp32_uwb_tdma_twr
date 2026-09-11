@@ -131,57 +131,145 @@ DWM1001's factory figure (16436), which is not correct for this board's
 antenna/PA path. There is no dedicated `$CAL` command; calibration is a
 manual measure-and-adjust loop against `ant_delay_tx`/`ant_delay_rx`.
 
-**Direction** (confirmed by the DWM1001 reference's own measured result —
-halving one node's antenna delay compensation, instead of applying the full
-value to both TX and RX, made a ~1 m true distance read as 77.8 m, and
-restoring the full value on both fixed it): **increasing** a node's
-`ant_delay` **shortens** the ranges it participates in; decreasing it
-lengthens them. The magnitude per DTU is on the order of `DISTANCE_OF_RADIO`
-(≈4.69 mm, one DTU ≈ 15.65 ps × speed of light in air) but is not pinned
-down exactly for a small single-node adjustment through the full DS-TWR
-combination — treat the delta below as a first-order estimate and iterate;
-one or two passes converges either way. Both `ant_delay_tx` and
-`ant_delay_rx` must always be set to the **same value** on a given board.
+*A parallel, more rigorous version of this procedure exists for the DWM1001
+reference firmware — `FLASHING_AND_CALIBRATION.md` on the
+`dwm1001-uwb-dstwr-firmware` branch of `d7-tech/HydroRL`. The scale and the
+fleet-wide strategy below are reconciled with it; one step from it
+(checking the chip's OTP for a factory-calibrated value before measuring)
+does **not** carry over here — see the note after Step 0.*
 
-**Procedure:**
+**Both registers, same value.** `ant_delay_tx` and `ant_delay_rx` must
+always be set to the same number on a given board. Each takes the full
+one-way delay for its own direction; splitting the correction between them
+under-compensates by roughly 77 m — measured on the DWM1001 hardware before
+it was corrected, and the same math applies here.
 
-1. Pick one reference anchor and one reference tag. Place them at a
-   precisely measured line-of-sight baseline (tape measure, antennas at the
-   same height, no obstructions) — e.g. exactly 5.000 m.
-2. `$RANGE,START` on both, let it run a few seconds to settle, then read the
-   mean measured range over a stable window:
+**Direction.** Increasing a node's antenna delay *shortens* the ranges it
+participates in; decreasing it lengthens them. If a pair reads longer than
+true, the delay is too small.
+
+**Scale.** One DTU (device time unit) is 15.650040 ps ≈ 4.69 mm of range —
+about 213 units per metre. Because both ends of a measurement contribute:
+
+| what you change | effect on the reported range |
+|---|---|
+| one board's delay, by 1 unit | ≈ 4.7 mm |
+| both boards' delays, by 1 unit each | ≈ 9.4 mm |
+
+The procedure below only ever changes one board at a time, so it uses the
+single-board figure (4.69 mm/unit) throughout.
+
+`ant_delay_tx`/`ant_delay_rx` are per-board config and **not** part of the
+config hash — boards can be calibrated one at a time, and the rest of the
+fleet doesn't need to be present.
+
+### Step 0 — factory value: does not apply on this board
+
+On the DWM1001 (a calibrated DWM1000 *module*), setting `ant_delay_tx` to
+the uncalibrated sentinel (`0xFFFF`/65535) makes the firmware read back a
+per-chip factory delay from OTP if one is programmed, which can remove the
+need to measure at all. **This firmware's `apply_antenna()` does not attempt
+that OTP read** — on the uncalibrated sentinel it always falls straight
+through to 16436, unconditionally. This was a deliberate choice: these are
+bare DW1000s behind an external PA and a non-Decawave antenna path, not
+calibrated modules, so any OTP figure (if even programmed) would not reflect
+this board's actual delay. Skip straight to Step 1 — there is nothing to
+check for here.
+
+### Step 1 — measure the error at a known distance
+
+1. Place one tag and one anchor antenna-face to antenna-face, clear line of
+   sight, nothing within about half a metre of the path, both at the same
+   height. **Pick a distance close to your actual operating range** — see
+   the nonlinearity note below for why.
+2. Write down the true distance (tape measure, ±5 mm is fine).
+3. `$RANGE,START` on both, let it settle a few seconds, then take the mean
+   over a stable window — not a single reading:
    ```bash
    ./range_table.py -w 15
    ```
-3. Compute the error and the delay correction:
-   ```
-   error_mm  = measured_mean_mm - true_distance_mm
-   delta_dtu = round(error_mm / 4.6918)
-   ```
-   Positive error (reading too long) → positive `delta_dtu` → **increase**
-   the tag's antenna delay. Negative error (reading too short) → decrease it.
-4. Apply to the **tag** only (keep the reference anchor fixed as your
-   truth reference throughout the whole campaign):
-   ```
-   $RANGE,STOP*..
-   $SET,ant_delay_tx,<old_value + delta_dtu>*..
-   $SET,ant_delay_rx,<old_value + delta_dtu>*..
-   $SAVE*..
-   $RESET*..
-   ```
-5. Re-measure. One pass is usually enough (the relationship is linear); if
-   the residual is still more than a couple of cm, repeat step 3-4 with the
-   new residual error.
-6. Repeat this whole procedure for every other tag against the **same**
-   reference anchor, one at a time. Once every tag is calibrated against it,
-   verify each additional anchor against one already-calibrated tag at a
-   fresh measured baseline — adjust that anchor's own `ant_delay_tx/rx` only
-   if it doesn't already read correctly (antenna delay variance between
-   boards of the same design is usually small).
+   The std dev shown should be a couple of cm; if it's much worse, fix the
+   physical setup before calibrating — the reading isn't stable enough to
+   calibrate against yet.
 
-`ant_delay_tx` and `ant_delay_rx` are per-board config (not hashed), so
-different boards can carry different calibrated values without affecting
-network compatibility.
+### Step 2 — work out the correction
+
+```
+error_mm  = measured_mean_mm - true_distance_mm
+delta_dtu = round(error_mm / 4.69)        # single board moving
+new_delay = old_delay + delta_dtu
+```
+
+Worked example — true 5.000 m, reported 5.187 m:
+```
+error = +187 mm   (reads long -> delay is too small)
+delta = round(187 / 4.69) = 40
+new   = 16436 + 40 = 16476
+```
+
+### Step 3 — apply to the tag only, and save
+
+Keep the reference anchor fixed as your truth reference for the whole
+campaign — only adjust the tag:
+```
+$RANGE,STOP*..
+$SET,ant_delay_tx,<new_delay>*..
+$SET,ant_delay_rx,<new_delay>*..
+$SAVE*..
+$RESET*..
+```
+Re-measure. One pass is usually enough; if the residual is still more than a
+couple of cm, repeat Step 2 with the new residual error.
+
+### Step 4 — confirm the scale is behaving (recommended)
+
+Before trusting a value across the fleet: change one board's delay by a
+large, deliberate amount — e.g. **+213 units**, which should shorten that
+pair by about **1 m** — measure, confirm the shift is close to 1 m, then put
+it back. If it isn't close, stop and re-check the setup before calibrating
+further; deriving a value from arithmetic alone (rather than checking it
+against hardware) is exactly how a halving-style error gets baked into a
+whole fleet.
+
+### Step 5 — the rest of the fleet
+
+The Step 1 measurement fixes the *sum* of two boards' offsets — it can't
+tell you how much belonged to each on its own. Two strategies:
+
+- **Quick — one value everywhere.** Apply the calibrated number to every
+  board. Removes the bulk of the error in one measurement, but leaves
+  board-to-board differences uncorrected (on the DWM1001 fleet this showed
+  up as two tags reading the same anchor up to 28 cm apart).
+- **Better — one fixed reference board.** Nominate a board (anchor or tag)
+  as the reference and never change it again. For every other board, survey
+  one distance to the reference and adjust *only that board* until it reads
+  true, using the single-board figure (4.69 mm/unit). More measurements, but
+  this is what makes different tags agree with each other on the same
+  anchor.
+
+### A caveat worth knowing
+
+On the DWM1001 hardware, the reported distance also carries a smaller error
+that varies *with* distance rather than being constant — roughly 19 cm
+across a 0.15–6 m span, strongest at close range (a known DW1000 near-field
+characteristic, not specific to that board). A constant antenna-delay
+correction cannot absorb it. This has not been separately measured on this
+ESP32 board's antenna/PA path, but the same underlying DW1000 effect likely
+applies to some degree. Two practical consequences either way:
+
+- Calibrate at a distance close to where the system will actually operate —
+  a delay fitted at 1 m will be off by a bit more than a decimetre at 5 m,
+  and the reverse.
+- If accuracy matters across a wide span, calibrate at both a near and a far
+  distance and treat the difference as this second term rather than folding
+  it into the antenna delay.
+
+### Record what you set
+
+Antenna delays live only in each board's flash and are written down nowhere
+else in this repo. `$DEFAULT` + `$SAVE`, or a full config wipe during
+provisioning, will erase a calibration. Keep a note — board, value, the
+distance it was measured at, and the date.
 
 ## Live telemetry (host tools)
 
